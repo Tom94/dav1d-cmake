@@ -16,15 +16,33 @@ if(POLICY CMP0025)
     cmake_policy(SET CMP0025 NEW)
 endif()
 
-set(DAV1D_API_VERSION_MAJOR 4)
-set(DAV1D_API_VERSION_MINOR 0)
-set(DAV1D_API_VERSION_PATCH 2)
-set(DAV1D_API_VERSION_REVISION 2)
+find_file(DAV1D_VERSION_H
+  NAMES dav1d/version.h
+  PATHS dav1d/include
+  NO_DEFAULT_PATH
+)
 
-set(API_VERSION_MAJOR 4)
-set(API_VERSION_MINOR 0)
-set(API_VERSION_PATCH 2)
-set(API_VERSION_REVISION 2)
+if(NOT DAV1D_VERSION_H)
+  message(FATAL_ERROR "Could not find dav1d/version.h in ${dav1d_inc_dirs}")
+endif()
+
+file(READ "${DAV1D_VERSION_H}" _dav1d_version_h)
+
+string(REGEX MATCH "DAV1D_API_VERSION_MAJOR[ \t]+([0-9]+)"
+  _match "${_dav1d_version_h}")
+set(DAV1D_API_VERSION_MAJOR "${CMAKE_MATCH_1}")
+
+string(REGEX MATCH "DAV1D_API_VERSION_MINOR[ \t]+([0-9]+)"
+  _match "${_dav1d_version_h}")
+set(DAV1D_API_VERSION_MINOR "${CMAKE_MATCH_1}")
+
+string(REGEX MATCH "DAV1D_API_VERSION_PATCH[ \t]+([0-9]+)"
+  _match "${_dav1d_version_h}")
+set(DAV1D_API_VERSION_REVISION "${CMAKE_MATCH_1}")
+
+set(API_VERSION_MAJOR DAV1D_API_VERSION_MAJOR)
+set(API_VERSION_MINOR DAV1D_API_VERSION_MINOR)
+set(API_VERSION_REVISION DAV1D_API_VERSION_REVISION)
 
 ###########
 # Options #
@@ -33,6 +51,7 @@ set(API_VERSION_REVISION 2)
 # bitdepths
 option(bitdepth_8 "Enable specified bitdepths" ON)
 option(bitdepth_16 "Enable specified bitdepths" ON)
+set(bitdepth_16 ON CACHE BOOL "Enable specified bitdepths" FORCE)
 
 # enable_asm
 option(enable_asm "Build asm files, if available" ON)
@@ -137,12 +156,21 @@ if(WIN32)
 else()
     set(THREAD_DEPENDENCY pthread)
 
+    check_include_file("pthread_np.h" HAVE_PTHREAD_NP_H)
+    check_symbol_exists(pthread_getaffinity_np "pthread_np.h" HAVE_PTHREAD_GETAFFINITY_NP)
+    check_symbol_exists(pthread_setaffinity_np "pthread_np.h" HAVE_PTHREAD_SETAFFINITY_NP)
+    check_symbol_exists(pthread_setname_np "pthread_np.h" HAVE_PTHREAD_SETNAME_NP)
+    check_symbol_exists(pthread_set_name_np "pthread_np.h" HAVE_PTHREAD_SET_NAME_NP)
+
     check_symbol_exists(clock_gettime "time.h" HAVE_CLOCK_GETTIME)
 
     if(NOT HAVE_CLOCK_GETTIME)
         message(FATAL_ERROR "clock_gettime not found")
     endif()
 endif()
+
+include(CheckCSourceCompiles)
+check_c_source_compiles("int x = _Generic(0, default: 0);" HAVE_C11_GENERIC)
 
 # check for fseeko on android. It is not always available if _FILE_OFFSET_BITS is defined to 64
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Android")
@@ -200,8 +228,9 @@ if(NOT HAS_STDATOMIC)
     endif()
 endif()
 
-check_include_file(unistd.h HAVE_UNISTD_H)
-check_include_file(io.h HAVE_IO_H)
+check_include_file("sys/types.h" HAVE_SYS_TYPES_H)
+check_include_file("unistd.h" HAVE_UNISTD_H)
+check_include_file("io.h" HAVE_IO_H)
 
 #
 # Function checks
@@ -215,7 +244,8 @@ if(NOT HAS_GETOPT_LONG)
     target_include_directories(getopt_dependency PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/dav1d/include/compat)
 endif()
 
-check_symbol_exists(_aligned_malloc "malloc.h" HAVE_ALIGNED_MALLOC)
+check_symbol_exists(sigaction "signal.h" HAVE_SIGACTION)
+check_symbol_exists(aligned_alloc "stdlib.h" HAVE_ALIGNED_ALLOC)
 check_symbol_exists(posix_memalign "stdlib.h" HAVE_POSIX_MEMALIGN)
 check_symbol_exists(memalign "malloc.h" HAVE_MEMALIGN)
 
@@ -385,6 +415,14 @@ if(${PROCESSOR} STREQUAL "ppc64")
     set(ARCH_PPC64LE 1)
 endif()
 
+if (${PROCESSOR} STREQUAL "loongarch64")
+    set(ARCH_LOONGARCH64 1)
+    set(ARCH_LOONGARCH 1)
+elseif (${PROCESSOR} STREQUAL "loongarch32")
+    set(ARCH_LOONGARCH32 1)
+    set(ARCH_LOONGARCH 1)
+endif()
+
 # https://mesonbuild.com/Release-notes-for-0-37-0.html#new-compiler-function-symbols_have_underscore_prefix
 # For example, Windows 32-bit prefixes underscore, but 64-bit does not.
 # Linux does not prefix an underscore but OS X does.
@@ -445,12 +483,13 @@ message(STATUS "Git revision: ${VCS_TAG}")
 configure_file(dav1d/include/vcs_version.h.in ${CMAKE_CURRENT_BINARY_DIR}/vcs_version.h)
 unset(VCS_TAG)
 
-configure_file(dav1d/include/dav1d/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/include/dav1d/version.h)
+# configure_file(dav1d/include/dav1d/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/include/dav1d/version.h)
 
 # libdav1d source files
 set(LIBDAV1D_SOURCES
     dav1d/src/cdf.c
     dav1d/src/cpu.c
+    dav1d/src/ctx.c
     dav1d/src/data.c
     dav1d/src/decode.c
     dav1d/src/dequant_tables.c
@@ -459,8 +498,10 @@ set(LIBDAV1D_SOURCES
     dav1d/src/itx_1d.c
     dav1d/src/lf_mask.c
     dav1d/src/log.c
+    dav1d/src/mem.c
     dav1d/src/msac.c
     dav1d/src/obu.c
+    dav1d/src/pal.c
     dav1d/src/picture.c
     dav1d/src/qm.c
     dav1d/src/ref.c
@@ -478,7 +519,7 @@ set(LIBDAV1D_TMPL_SOURCES
     dav1d/src/cdef_apply_tmpl.c
     dav1d/src/cdef_tmpl.c
     dav1d/src/fg_apply_tmpl.c
-    dav1d/src/film_grain_tmpl.c
+    dav1d/src/filmgrain_tmpl.c
     dav1d/src/ipred_prepare_tmpl.c
     dav1d/src/ipred_tmpl.c
     dav1d/src/itx_tmpl.c
@@ -509,14 +550,6 @@ set(ARCH_SPECIFIC_FLAGS "")
 if(HAVE_ASM)
     if(ARCH_ARM)
         list(APPEND LIBDAV1D_SOURCES dav1d/src/arm/cpu.c)
-        list(APPEND LIBDAV1D_TMPL_SOURCES
-            dav1d/src/arm/cdef_init_tmpl.c
-            dav1d/src/arm/ipred_init_tmpl.c
-            dav1d/src/arm/itx_init_tmpl.c
-            dav1d/src/arm/loopfilter_init_tmpl.c
-            dav1d/src/arm/looprestoration_init_tmpl.c
-            dav1d/src/arm/mc_init_tmpl.c
-        )
 
         if(ARCH_AARCH64)
             list(APPEND LIBDAV1D_SOURCES
@@ -563,16 +596,6 @@ if(HAVE_ASM)
     elseif(ARCH_X86)
         list(APPEND LIBDAV1D_SOURCES
             dav1d/src/x86/cpu.c
-            dav1d/src/x86/msac_init.c
-        )
-        list(APPEND LIBDAV1D_TMPL_SOURCES
-            dav1d/src/x86/cdef_init_tmpl.c
-            dav1d/src/x86/film_grain_init_tmpl.c
-            dav1d/src/x86/ipred_init_tmpl.c
-            dav1d/src/x86/itx_init_tmpl.c
-            dav1d/src/x86/loopfilter_init_tmpl.c
-            dav1d/src/x86/looprestoration_init_tmpl.c
-            dav1d/src/x86/mc_init_tmpl.c
         )
 
         # NASM source files
@@ -585,14 +608,14 @@ if(HAVE_ASM)
             list(APPEND LIBDAV1D_SOURCES_ASM
                 dav1d/src/x86/cdef_avx512.asm
                 dav1d/src/x86/cdef_avx2.asm
-                dav1d/src/x86/film_grain.asm
+                dav1d/src/x86/filmgrain.asm
                 dav1d/src/x86/ipred.asm
                 dav1d/src/x86/itx.asm
                 dav1d/src/x86/loopfilter.asm
                 dav1d/src/x86/looprestoration.asm
                 dav1d/src/x86/mc.asm
                 dav1d/src/x86/cdef_sse.asm
-                dav1d/src/x86/film_grain_ssse3.asm
+                dav1d/src/x86/filmgrain_ssse3.asm
                 dav1d/src/x86/ipred_ssse3.asm
                 dav1d/src/x86/itx_ssse3.asm
                 dav1d/src/x86/loopfilter_ssse3.asm
@@ -606,8 +629,11 @@ if(HAVE_ASM)
             dav1d/src/ppc/cpu.c
         )
         list(APPEND LIBDAV1D_ARCH_TMPL_SOURCES
-            dav1d/src/ppc/cdef_init_tmpl.c
-            dav1d/src/ppc/looprestoration_init_tmpl.c
+            dav1d/src/ppc/cdef_tmpl.c
+            dav1d/src/ppc/itx_tmpl.c
+            dav1d/src/ppc/loopfilter_tmpl.c
+            dav1d/src/ppc/looprestoration_tmpl.c
+            dav1d/src/ppc/mc_tmpl.c
         )
     endif()
 endif()

@@ -7,3 +7,5 @@
 #define PREFIX UNDERSCORE_PREFIXED
 #endif
 #cmakedefine01 HAVE_AVX512ICL
+#cmakedefine private_prefix @private_prefix@
+#cmakedefine01 FORCE_VEX_ENCODING

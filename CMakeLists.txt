@@ -96,15 +96,77 @@ foreach(BITS IN LISTS bitdepths)
     set(CONFIG_${BITS}BPC 1)
 endforeach()
 
-include(TargetArch.cmake)
+function(target_architecture output_var)
+    if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+        # Explicit arch list wins (universal or forced single arch)
+        set(archs "")
+        foreach(a ${CMAKE_OSX_ARCHITECTURES})
+            if(a STREQUAL "arm64")
+                list(APPEND archs "arm64")
+            elseif(a STREQUAL "x86_64")
+                list(APPEND archs "x86_64")
+            elseif(a STREQUAL "i386")
+                list(APPEND archs "i386")
+            else()
+                list(APPEND archs "${a}")
+            endif()
+        endforeach()
+        set(${output_var} "${archs}" PARENT_SCOPE)
+        return()
+    endif()
+
+    set(archdetect [[
+#if defined(__aarch64__) || defined(__arm64__) || defined(__arm64) || defined(_M_ARM64)
+    #error cmake_ARCH aarch64
+#elif defined(__ARM_ARCH) || defined(__arm__) || defined(__thumb__) || defined(_M_ARM)
+    #error cmake_ARCH arm
+#elif defined(__x86_64__) || defined(__x86_64) || defined(__amd64) || defined(_M_X64) || defined(_M_AMD64)
+    #error cmake_ARCH x86_64
+#elif defined(__i386__) || defined(__i386) || defined(_M_IX86)
+    #error cmake_ARCH i386
+#elif defined(__ppc64__) || defined(__powerpc64__)
+    #error cmake_ARCH ppc64
+#elif defined(__ppc__) || defined(__powerpc__)
+    #error cmake_ARCH ppc
+#elif defined(__riscv) && __riscv_xlen == 64
+    #error cmake_ARCH riscv64
+#else
+    #error cmake_ARCH unknown
+#endif
+]])
+
+    set(probe "${CMAKE_CURRENT_BINARY_DIR}/arch_probe.c")
+    file(WRITE "${probe}" "${archdetect}")
+
+    enable_language(C)
+    try_run(run_result compile_result
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        "${probe}"
+        COMPILE_OUTPUT_VARIABLE compile_out)
+
+    string(REGEX MATCH "cmake_ARCH ([a-zA-Z0-9_]+)" _ "${compile_out}")
+    set(arch "${CMAKE_MATCH_1}")
+
+    if(NOT arch)
+        set(arch "unknown")
+    endif()
+
+    set(${output_var} "${arch}" PARENT_SCOPE)
+endfunction()
+
 target_architecture(PROCESSOR)
 
 if(${PROCESSOR} STREQUAL "i386" OR ${PROCESSOR} STREQUAL "x86_64")
     set(ARCH_X86 1)
 endif()
 
+if(${PROCESSOR} STREQUAL "riscv64" OR ${PROCESSOR} STREQUAL "riscv32")
+    set(ARCH_RISCV 1)
+endif()
+
 if(enable_asm)
-    if(ARCH_X86 OR ${PROCESSOR} STREQUAL "aarch64" OR ${PROCESSOR} MATCHES "^arm" OR ${PROCESSOR} STREQUAL "ppc64")
+    # NOTE: MSVC does not support .S assembly files, so disable asm on ARM-based Windows. X86 is fine via NASM
+    if(ARCH_X86 OR ((${PROCESSOR} STREQUAL "aarch64" OR ${PROCESSOR} MATCHES "^arm") AND NOT WIN32))
         set(HAVE_ASM 1)
     endif()
 endif()
@@ -169,8 +231,20 @@ else()
     endif()
 endif()
 
-include(CheckCSourceCompiles)
-check_c_source_compiles("int x = _Generic(0, default: 0);" HAVE_C11_GENERIC)
+# Compile+link check of an asm fragment. Writes to a file to avoid
+# check_c_source_compiles mangling backslash/quote escapes. The caller
+# passes only the __asm__ argument list; we wrap it in a main().
+function(check_c_compiles out_var c_code)
+    set(_f "${CMAKE_BINARY_DIR}/ccheck_${out_var}.c")
+    file(WRITE "${_f}" "${c_code}")
+    try_compile(_res
+        "${CMAKE_BINARY_DIR}/asmcheck_${out_var}_dir"
+        SOURCES "${_f}")
+    set(${out_var} ${_res} PARENT_SCOPE)
+endfunction()
+
+check_c_compiles(HAVE_C11_GENERIC "int main(void){ int x = _Generic(0, default: 0); return 0; }\n")
+message(STATUS "HAVE_C11_GENERIC: ${HAVE_C11_GENERIC}")
 
 # check for fseeko on android. It is not always available if _FILE_OFFSET_BITS is defined to 64
 if(${CMAKE_SYSTEM_NAME} STREQUAL "Android")
@@ -324,68 +398,147 @@ endforeach()
 # Stack alignments flags
 #
 include(TestBigEndian)
-set(STACKALIGN_FLAG "")
-set(STACKREALIGN_FLAG "")
 test_big_endian(ENDIANNESS_BIG)
+
+set(TRIM_DSP_FUNCTIONS 0)
 
 if(ARCH_X86)
     if(${stack_alignment} GREATER 0)
         set(STACK_ALIGNMENT ${stack_alignment})
     elseif(${PROCESSOR} STREQUAL "x86_64")
-        check_c_compiler_flag("-mpreferred-stack-boundary=6" _HAS_PREFER_STACK_BOUNDARY)
-
-        if(_HAS_PREFER_STACK_BOUNDARY)
-            list(APPEND STACKALIGN_FLAG "-mpreferred-stack-boundary=6")
-            list(APPEND STACKREALIGN_FLAG "-mincoming-stack-boundary=4")
-            set(STACK_ALIGNMENT 32)
-        else()
-            check_c_compiler_flag("-mstack-alignment=64" _HAS_STACK_ALIGN)
-
-            if(_HAS_STACK_ALIGN)
-                list(APPEND STACKALIGN_FLAG "-mstack-alignment=64")
-                list(APPEND STACKREALIGN_FLAG "-mstackrealign")
-                set(STACK_ALIGNMENT 32)
-            else()
-                set(STACK_ALIGNMENT 16)
-            endif()
-        endif()
+        set(STACK_ALIGNMENT 16)
+    elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "Darwin" OR APPLE)
+        set(STACK_ALIGNMENT 16)
     else()
-        if(${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-            set(STACK_ALIGNMENT 16)
-        else()
-            check_c_compiler_flag("-mpreferred-stack-boundary=4" "_HAS_PREFER_STACK_BOUNDARY")
-
-            if(_HAS_PREFER_STACK_BOUNDARY)
-                list(APPEND STACKALIGN_FLAG "-mpreferred-stack-boundary=4")
-                list(APPEND STACKREALIGN_FLAG "-mincoming-stack-boundary=2")
-                set(STACK_ALIGNMENT 16)
-            else()
-                check_c_compiler_flag("-mstack-alignment=16" _HAS_STACK_ALIGN)
-
-                if(_HAS_STACK_ALIGN)
-                    list(APPEND STACKALIGN_FLAG "-mstack-alignment=16")
-                    list(APPEND STACKREALIGN_FLAG "-mstackrealign")
-                    set(STACK_ALIGNMENT 16)
-                else()
-                    set(STACK_ALIGNMENT 4)
-                endif()
-            endif()
-        endif()
+        set(STACK_ALIGNMENT 4)
     endif()
 endif()
 
-if(${PROCESSOR} STREQUAL "aarch64")
+if(${PROCESSOR} STREQUAL "aarch64" OR ${PROCESSOR} STREQUAL "arm64")
     set(ARCH_AARCH64 1)
-    set(ARCH_ARM 1)
 elseif(${PROCESSOR} MATCHES "^arm")
-    set(ARCH_ASM 1)
+    set(ARCH_ARM 1)
 endif()
 
-if(HAVE_ASM AND ARCH_ARM)
+if(HAVE_ASM AND (ARCH_ARM OR ARCH_AARCH64))
     enable_language(ASM)
 
     set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-    try_compile(HAVE_AS_FUNC ${CMAKE_CURRENT_BINARY_DIR} test_as.c)
+
+    # Compile+link check of an asm fragment. Writes to a file to avoid
+    # check_c_source_compiles mangling backslash/quote escapes. The caller
+    # passes only the __asm__ argument list; we wrap it in a main().
+    function(check_asm_compiles out_var asm_args)
+        set(_f "${CMAKE_BINARY_DIR}/asmcheck_${out_var}.c")
+        file(WRITE "${_f}" "int main(void){ ${asm_args} return 0; }\n")
+        try_compile(_res
+            "${CMAKE_BINARY_DIR}/asmcheck_${out_var}_dir"
+            SOURCES "${_f}")
+        set(${out_var} ${_res} PARENT_SCOPE)
+    endfunction()
+
+    check_asm_compiles(HAVE_AS_FUNC "__asm__ (
+        \".func meson_test\"
+        \".endfunc\"
+    );")
+
+    check_asm_compiles(HAVE_AS_ARCH_DIRECTIVE "__asm__ (\".arch armv8-a\\n\");")
+
+    message(STATUS "HAVE_AS_FUNC: ${HAVE_AS_FUNC}")
+    message(STATUS "HAVE_AS_ARCH_DIRECTIVE: ${HAVE_AS_ARCH_DIRECTIVE}")
+
+    if (HAVE_AS_ARCH_DIRECTIVE)
+        set(as_arch_level "armv8-a")
+
+        # Check what .arch levels are supported. In principle, we only
+        # want to detect up to armv8.2-a here (binutils requires that
+        # in order to enable i8mm). However, older Clang versions
+        # (before Clang 17, and Xcode versions up to and including 15.0)
+        # didn't support controlling dotprod/i8mm extensions via
+        # .arch_extension, therefore try to enable a high enough .arch
+        # level as well, to implicitly make them available via that.
+        foreach(arch "armv8.2-a" "armv8.4-a" "armv8.6-a")
+            check_asm_compiles(as_arch_supports_${arch} "__asm__ (\".arch ${arch}\\n\");")
+            if(as_arch_supports_${arch})
+                set(as_arch_level "${arch}")
+            endif()
+        endforeach()
+
+        # Clang versions before 17 also had a bug
+        # (https://github.com/llvm/llvm-project/issues/32220)
+        # causing a plain ".arch <level>" to not have any effect unless it
+        # had an extra "+<feature>" included - but it was activated on the
+        # next ".arch_extension" directive instead. Check if we can include
+        # "+crc" as dummy feature to make the .arch directive behave as
+        # expected and take effect right away.
+        check_asm_compiles(as_arch_level_supports_crc "__asm__ (\".arch ${as_arch_level}+crc\\n\");")
+        if(as_arch_level_supports_crc)
+            set(as_arch_level "${as_arch_level}+crc")
+        endif()
+
+        set(AS_ARCH_LEVEL "${as_arch_level}")
+        set(as_arch_str "\".arch ${as_arch_level}\\n\"")
+
+        message(STATUS "AS_ARCH_LEVEL: ${AS_ARCH_LEVEL}")
+    endif()
+
+    # aarch64 extension test instructions.
+    set(aarch64_ext_names    "dotprod" "i8mm" "sve" "sve2")
+    set(aarch64_ext_dotprod  "udot v0.4s, v0.16b, v0.16b")
+    set(aarch64_ext_i8mm     "usdot v0.4s, v0.16b, v0.16b")
+    set(aarch64_ext_sve      "whilelt p0.s, x0, x1")
+    set(aarch64_ext_sve2     "sqrdmulh z0.s, z0.s, z0.s")
+
+    set(supported_aarch64_archexts "")
+    set(supported_aarch64_instructions "")
+
+    foreach(name ${aarch64_ext_names})
+        set(instr "${aarch64_ext_${name}}")
+
+        # Test for support for the various extensions. First test if
+        # the assembler supports the .arch_extension directive for
+        # enabling/disabling the extension, then separately check whether
+        # the instructions themselves are supported. Even if .arch_extension
+        # isn't supported, we may be able to assemble the instructions
+        # if the .arch level includes support for them.
+        string(TOUPPER "${name}" name_upper)
+
+        check_asm_compiles(as_supports_archext_${name} "__asm__ (${as_arch_str}\".arch_extension ${name}\\n\");")
+
+        set(instr_code "__asm__ (${as_arch_str}")
+        if(as_supports_archext_${name})
+            list(APPEND supported_aarch64_archexts "${name}")
+            string(APPEND instr_code "\".arch_extension ${name}\\n\"")
+        endif()
+        string(APPEND instr_code "\"${instr}\\n\");")
+
+        check_asm_compiles(as_supports_instr_${name} "${instr_code}")
+        if(as_supports_instr_${name})
+            list(APPEND supported_aarch64_instructions "${name}")
+        endif()
+    endforeach()
+
+    message(STATUS "Supported AArch64 .arch_extension: ${supported_aarch64_archexts}")
+    message(STATUS "Supported AArch64 instructions: ${supported_aarch64_instructions}")
+
+    foreach(name ${aarch64_ext_names})
+        string(TOUPPER "${name}" name_upper)
+
+        if("${name}" IN_LIST supported_aarch64_archexts)
+            set(HAVE_AS_ARCHEXT_${name_upper}_DIRECTIVE 1)
+        else()
+            set(HAVE_AS_ARCHEXT_${name_upper}_DIRECTIVE 0)
+        endif()
+
+        if("${name}" IN_LIST supported_aarch64_instructions)
+            set(HAVE_${name_upper} 1)
+        else()
+            set(HAVE_${name_upper} 0)
+        endif()
+
+        message(STATUS "HAVE_AS_ARCHEXT_${name_upper}_DIRECTIVE: ${HAVE_AS_ARCHEXT_${name_upper}_DIRECTIVE}")
+        message(STATUS "HAVE_${name_upper}: ${HAVE_${name_upper}}")
+    endforeach()
 
     # fedora package build infrastructure uses a gcc specs file to enable
     # '-fPIE' by default. The chosen way only adds '-fPIE' to the C compiler
@@ -393,7 +546,7 @@ if(HAVE_ASM AND ARCH_ARM)
     # preprocessor or the preprocessing stage of '.S' files. So we have to
     # compile code to check if we have to define PIC for the arm asm to
     # avoid absolute relocations when building for example checkasm.
-    try_compile(_HAS_PIC ${CMAKE_CURRENT_BINARY_DIR} check_pic_code.c)
+    try_compile(_HAS_PIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/check_pic_code.c)
     unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
 
     if(_HAS_PIC)
@@ -402,6 +555,16 @@ if(HAVE_ASM AND ARCH_ARM)
 endif()
 
 if(ARCH_X86)
+    set(private_prefix "dav1d")
+
+    check_c_compiles(FORCE_VEX_ENCODING "
+        #ifndef __AVX__
+        #error no avx
+        #endif
+        int main(void) { return 0; }
+    ")
+
+    # Convert SSE asm into (128-bit) AVX when compiler flags are set to use AVX instructions
     if(${PROCESSOR} STREQUAL "x86_64")
         set(ARCH_X86_64 1)
     else()
@@ -426,8 +589,8 @@ endif()
 # https://mesonbuild.com/Release-notes-for-0-37-0.html#new-compiler-function-symbols_have_underscore_prefix
 # For example, Windows 32-bit prefixes underscore, but 64-bit does not.
 # Linux does not prefix an underscore but OS X does.
-if(WIN32 AND NOT WIN64 OR ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
-    #set(UNDERSCORE_PREFIXED 1)
+if((WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND ARCH_X86) OR ${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    set(UNDERSCORE_PREFIXED 1)
 endif()
 
 #
@@ -548,7 +711,7 @@ set(LIBDAV1D_SOURCES_ASM "")
 set(ARCH_SPECIFIC_FLAGS "")
 
 if(HAVE_ASM)
-    if(ARCH_ARM)
+    if(ARCH_ARM OR ARCH_AARCH64)
         list(APPEND LIBDAV1D_SOURCES dav1d/src/arm/cpu.c)
 
         if(ARCH_AARCH64)
@@ -557,39 +720,61 @@ if(HAVE_ASM)
                 dav1d/src/arm/64/itx.S
                 dav1d/src/arm/64/looprestoration_common.S
                 dav1d/src/arm/64/msac.S
+                dav1d/src/arm/64/refmvs.S
             )
 
             if(CONFIG_8BPC)
                 list(APPEND LIBDAV1D_SOURCES
                     dav1d/src/arm/64/cdef.S
+                    dav1d/src/arm/64/filmgrain.S
                     dav1d/src/arm/64/ipred.S
                     dav1d/src/arm/64/loopfilter.S
                     dav1d/src/arm/64/looprestoration.S
                     dav1d/src/arm/64/mc.S
+                    dav1d/src/arm/64/mc_dotprod.S
                 )
             endif()
 
             if(CONFIG_16BPC)
-                list(APPEND LIBDAVID_SOURCES
+                list(APPEND LIBDAV1D_SOURCES
                     dav1d/src/arm/64/cdef16.S
+                    dav1d/src/arm/64/filmgrain16.S
                     dav1d/src/arm/64/ipred16.S
                     dav1d/src/arm/64/itx16.S
                     dav1d/src/arm/64/loopfilter16.S
                     dav1d/src/arm/64/looprestoration16.S
                     dav1d/src/arm/64/mc16.S
+                    dav1d/src/arm/64/mc16_sve.S
                 )
             endif()
         else()
-            list(APPEND LIBDAV1D_SOURCES dav1d/src/arm/32/msac.S)
+            list(APPEND LIBDAV1D_SOURCES
+                dav1d/src/arm/32/itx.S
+                dav1d/src/arm/32/looprestoration_common.S
+                dav1d/src/arm/32/msac.S
+                dav1d/src/arm/32/refmvs.S
+            )
 
             if(CONFIG_8BPC)
                 list(APPEND LIBDAV1D_SOURCES
                     dav1d/src/arm/32/cdef.S
+                    dav1d/src/arm/32/filmgrain.S
                     dav1d/src/arm/32/ipred.S
-                    dav1d/src/arm/32/itx.S
                     dav1d/src/arm/32/loopfilter.S
                     dav1d/src/arm/32/looprestoration.S
                     dav1d/src/arm/32/mc.S
+                )
+            endif()
+
+            if(CONFIG_16BPC)
+                list(APPEND LIBDAV1D_SOURCES
+                    dav1d/src/arm/32/cdef16.S
+                    dav1d/src/arm/32/filmgrain16.S
+                    dav1d/src/arm/32/ipred16.S
+                    dav1d/src/arm/32/itx16.S
+                    dav1d/src/arm/32/loopfilter16.S
+                    dav1d/src/arm/32/looprestoration16.S
+                    dav1d/src/arm/32/mc16.S
                 )
             endif()
         endif()
@@ -602,40 +787,64 @@ if(HAVE_ASM)
         list(APPEND LIBDAV1D_SOURCES_ASM
             dav1d/src/x86/cpuid.asm
             dav1d/src/x86/msac.asm
+            dav1d/src/x86/pal.asm
+            dav1d/src/x86/refmvs.asm
+            dav1d/src/x86/itx_avx512.asm
+            dav1d/src/x86/cdef_avx2.asm
+            dav1d/src/x86/itx_avx2.asm
+            dav1d/src/x86/cdef_sse.asm
+            dav1d/src/x86/itx_sse.asm
         )
 
         if(CONFIG_8BPC)
             list(APPEND LIBDAV1D_SOURCES_ASM
                 dav1d/src/x86/cdef_avx512.asm
-                dav1d/src/x86/cdef_avx2.asm
-                dav1d/src/x86/filmgrain.asm
-                dav1d/src/x86/ipred.asm
-                dav1d/src/x86/itx.asm
-                dav1d/src/x86/loopfilter.asm
-                dav1d/src/x86/looprestoration.asm
-                dav1d/src/x86/mc.asm
+                dav1d/src/x86/filmgrain_avx512.asm
+                dav1d/src/x86/ipred_avx512.asm
+                dav1d/src/x86/loopfilter_avx512.asm
+                dav1d/src/x86/looprestoration_avx512.asm
+                dav1d/src/x86/mc_avx512.asm
+                dav1d/src/x86/filmgrain_avx2.asm
+                dav1d/src/x86/ipred_avx2.asm
+                dav1d/src/x86/loopfilter_avx2.asm
+                dav1d/src/x86/looprestoration_avx2.asm
+                dav1d/src/x86/mc_avx2.asm
                 dav1d/src/x86/cdef_sse.asm
-                dav1d/src/x86/filmgrain_ssse3.asm
-                dav1d/src/x86/ipred_ssse3.asm
-                dav1d/src/x86/itx_ssse3.asm
-                dav1d/src/x86/loopfilter_ssse3.asm
-                dav1d/src/x86/looprestoration_ssse3.asm
+                dav1d/src/x86/filmgrain_sse.asm
+                dav1d/src/x86/ipred_sse.asm
+                dav1d/src/x86/loopfilter_sse.asm
+                dav1d/src/x86/looprestoration_sse.asm
                 dav1d/src/x86/mc_sse.asm
             )
         endif()
-    elseif(ARCH_PPC64LE)
-        list(APPEND ARCH_SPECIFIC_FLAGS -maltivec -mvsx)
-        list(APPEND LIBDAV1D_SOURCES
-            dav1d/src/ppc/cpu.c
-        )
-        list(APPEND LIBDAV1D_ARCH_TMPL_SOURCES
-            dav1d/src/ppc/cdef_tmpl.c
-            dav1d/src/ppc/itx_tmpl.c
-            dav1d/src/ppc/loopfilter_tmpl.c
-            dav1d/src/ppc/looprestoration_tmpl.c
-            dav1d/src/ppc/mc_tmpl.c
-        )
+
+        if(CONFIG_16BPC)
+            list(APPEND LIBDAV1D_SOURCES_ASM
+                dav1d/src/x86/cdef16_avx512.asm
+                dav1d/src/x86/filmgrain16_avx512.asm
+                dav1d/src/x86/ipred16_avx512.asm
+                dav1d/src/x86/itx16_avx512.asm
+                dav1d/src/x86/loopfilter16_avx512.asm
+                dav1d/src/x86/looprestoration16_avx512.asm
+                dav1d/src/x86/mc16_avx512.asm
+                dav1d/src/x86/cdef16_avx2.asm
+                dav1d/src/x86/filmgrain16_avx2.asm
+                dav1d/src/x86/ipred16_avx2.asm
+                dav1d/src/x86/itx16_avx2.asm
+                dav1d/src/x86/loopfilter16_avx2.asm
+                dav1d/src/x86/looprestoration16_avx2.asm
+                dav1d/src/x86/mc16_avx2.asm
+                dav1d/src/x86/cdef16_sse.asm
+                dav1d/src/x86/filmgrain16_sse.asm
+                dav1d/src/x86/ipred16_sse.asm
+                dav1d/src/x86/itx16_sse.asm
+                dav1d/src/x86/loopfilter16_sse.asm
+                dav1d/src/x86/looprestoration16_sse.asm
+                dav1d/src/x86/mc16_sse.asm
+            )
+        endif()
     endif()
+    # TODO: add powerpc, loongarch, riscv. Not needed in tev, so not implemented yet
 endif()
 
 #
@@ -668,18 +877,51 @@ set(LIBDAV1D_INCLUDE_DIRS
     ${CMAKE_CURRENT_BINARY_DIR}/include/dav1d
 )
 
+# Helper library for each bitdepth (and architecture-specific flags)
+set(DAV1D_BITDEPTH_OBJECTS "")
+foreach(BITS IN LISTS bitdepths)
+    add_library(dav1d_bitdepth_${BITS} OBJECT ${LIBDAV1D_TMPL_SOURCES})
+    set_property(TARGET dav1d_bitdepth_${BITS} PROPERTY POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(dav1d_bitdepth_${BITS} PRIVATE ${LIBDAV1D_INCLUDE_DIRS_PRIV})
+    target_include_directories(dav1d_bitdepth_${BITS} PUBLIC ${LIBDAV1D_INCLUDE_DIRS})
+    target_compile_options(dav1d_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_FLAGS})
+    target_compile_definitions(dav1d_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_DEFS} BITDEPTH=${BITS})
+
+    if(NOT HAS_STDATOMIC)
+        target_link_libraries(dav1d_bitdepth_${BITS} stdatomic_dependency)
+    endif()
+
+    list(APPEND DAV1D_BITDEPTH_OBJECTS $<TARGET_OBJECTS:dav1d_bitdepth_${BITS}>)
+
+    if(LIBDAV1D_ARCH_TMPL_SOURCES)
+        add_library(dav1d_arch_bitdepth_${BITS} OBJECT ${LIBDAV1D_ARCH_TMPL_SOURCES})
+        set_property(TARGET dav1d_arch_bitdepth_${BITS} PROPERTY POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(dav1d_arch_bitdepth_${BITS} PRIVATE ${LIBDAV1D_INCLUDE_DIRS_PRIV})
+        target_include_directories(dav1d_arch_bitdepth_${BITS} PUBLIC ${LIBDAV1D_INCLUDE_DIRS})
+        target_compile_options(dav1d_arch_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_FLAGS} ${ARCH_SPECIFIC_FLAGS})
+        target_compile_definitions(dav1d_arch_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_DEFS} BITDEPTH=${BITS})
+        if(NOT HAS_STDATOMIC)
+            target_link_libraries(dav1d_arch_bitdepth_${BITS} stdatomic_dependency)
+        endif()
+
+        list(APPEND DAV1D_BITDEPTH_OBJECTS $<TARGET_OBJECTS:dav1d_arch_bitdepth_${BITS}>)
+    endif()
+endforeach()
+
 # The final dav1d library
-add_library(dav1d ${TEMP_COMPAT_FILES} ${LIBDAV1D_SOURCES} ${LIBDAV1D_SOURCES_ASM} ${LIBDAV1D_ENTRYPOINT_SOURCES})
+add_library(dav1d
+    ${TEMP_COMPAT_FILES}
+    ${LIBDAV1D_SOURCES}
+    ${LIBDAV1D_SOURCES_ASM}
+    ${LIBDAV1D_ENTRYPOINT_SOURCES}
+    ${DAV1D_BITDEPTH_OBJECTS}
+)
+
 target_include_directories(dav1d PRIVATE ${LIBDAV1D_INCLUDE_DIRS_PRIV})
 target_include_directories(dav1d PUBLIC ${LIBDAV1D_INCLUDE_DIRS})
-target_compile_options(dav1d PRIVATE ${STACKALIGN_FLAG} ${STACKREALIGN_FLAG})
 target_compile_definitions(dav1d PRIVATE ${TEMP_COMPILE_DEFS} ${API_EXPORT_DEFS})
 
 add_library(dav1d::dav1d ALIAS dav1d)
-
-if(STACKREALIGN_FLAG)
-    set_source_files_properties(${LIBDAV1D_ENTRYPOINT_SOURCES} PROPERTIES COMPILE_FLAGS ${STACKREALIGN_FLAG})
-endif()
 
 if(NOT WIN32)
     set_target_properties(dav1d PROPERTIES SOVERSION "${DAV1D_API_VERSION_MAJOR}")
@@ -694,35 +936,6 @@ endif()
 if(NOT HAS_STDATOMIC)
     target_link_libraries(dav1d stdatomic_dependency)
 endif()
-
-# Helper library for each bitdepth (and architecture-specific flags)
-foreach(BITS IN LISTS bitdepths)
-    add_library(dav1d_bitdepth_${BITS} STATIC ${LIBDAV1D_TMPL_SOURCES})
-    set_property(TARGET dav1d_bitdepth_${BITS} PROPERTY POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(dav1d_bitdepth_${BITS} PRIVATE ${LIBDAV1D_INCLUDE_DIRS_PRIV})
-    target_include_directories(dav1d_bitdepth_${BITS} PUBLIC ${LIBDAV1D_INCLUDE_DIRS})
-    target_compile_options(dav1d_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_FLAGS} ${STACKALIGN_FLAG})
-    target_compile_definitions(dav1d_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_DEFS} BITDEPTH=${BITS})
-    target_link_libraries(dav1d dav1d_bitdepth_${BITS})
-
-    if(NOT HAS_STDATOMIC)
-        target_link_libraries(dav1d_bitdepth_${BITS} stdatomic_dependency)
-    endif()
-
-    if(LIBDAV1D_ARCH_TMPL_SOURCES)
-        add_library(dav1d_arch_bitdepth_${BITS} STATIC ${LIBDAV1D_ARCH_TMPL_SOURCES})
-        set_property(TARGET dav1d_arch_bitdepth_${BITS} PROPERTY POSITION_INDEPENDENT_CODE ON)
-        target_include_directories(dav1d_arch_bitdepth_${BITS} PRIVATE ${LIBDAV1D_INCLUDE_DIRS_PRIV})
-        target_include_directories(dav1d_arch_bitdepth_${BITS} PUBLIC ${LIBDAV1D_INCLUDE_DIRS})
-        target_compile_options(dav1d_arch_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_FLAGS} ${STACKALIGN_FLAG} ${ARCH_SPECIFIC_FLAGS})
-        target_compile_definitions(dav1d_arch_bitdepth_${BITS} PRIVATE ${TEMP_COMPILE_DEFS} BITDEPTH=${BITS})
-        target_link_libraries(dav1d dav1d_arch_bitdepth_${BITS})
-
-        if(NOT HAS_STDATOMIC)
-            target_link_libraries(dav1d_arch_bitdepth_${BITS} stdatomic_dependency)
-        endif()
-    endif()
-endforeach()
 
 if(TEMP_LINK_LIBRARIES)
     target_link_directories(dav1d PUBLIC ${TEMP_LINK_LIBRARIES})

@@ -5,7 +5,7 @@
 # repository, modified to detect AArch64. To get the unmodified version, visit
 # https://github.com/axr/solar-cmake/blob/73cfea0/TargetArch.cmake
 
-cmake_minimum_required(VERSION 3.8.0)
+cmake_minimum_required(VERSION 3.10.0)
 
 set(CMAKE_C_STANDARD 99)
 
@@ -18,10 +18,12 @@ endif()
 
 set(DAV1D_API_VERSION_MAJOR 4)
 set(DAV1D_API_VERSION_MINOR 0)
+set(DAV1D_API_VERSION_PATCH 2)
 set(DAV1D_API_VERSION_REVISION 2)
 
 set(API_VERSION_MAJOR 4)
 set(API_VERSION_MINOR 0)
+set(API_VERSION_PATCH 2)
 set(API_VERSION_REVISION 2)
 
 ###########
@@ -30,7 +32,7 @@ set(API_VERSION_REVISION 2)
 
 # bitdepths
 option(bitdepth_8 "Enable specified bitdepths" ON)
-option(bitdepth_16 "Enable specified bitdepths" OFF)
+option(bitdepth_16 "Enable specified bitdepths" ON)
 
 # enable_asm
 option(enable_asm "Build asm files, if available" ON)
@@ -39,7 +41,7 @@ option(enable_asm "Build asm files, if available" ON)
 option(enable_avx512 "Build AVX-512 asm files, requires nasm 2.14" ON)
 
 # enable_tools
-option(enable_tools "Build dav1d cli tools" ON)
+option(enable_tools "Build dav1d cli tools" OFF)
 
 # enable_examples
 option(enable_examples "Build dav1d examples" OFF)

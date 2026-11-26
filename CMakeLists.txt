@@ -718,6 +718,7 @@ if(HAVE_ASM)
             list(APPEND LIBDAV1D_SOURCES
                 # itx.S is used for both 8 and 16 bpc.
                 dav1d/src/arm/64/itx.S
+                dav1d/src/arm/64/lf_mask.S
                 dav1d/src/arm/64/looprestoration_common.S
                 dav1d/src/arm/64/msac.S
                 dav1d/src/arm/64/refmvs.S
@@ -786,11 +787,13 @@ if(HAVE_ASM)
         # NASM source files
         list(APPEND LIBDAV1D_SOURCES_ASM
             dav1d/src/x86/cpuid.asm
+            dav1d/src/x86/lf_mask.asm
             dav1d/src/x86/msac.asm
             dav1d/src/x86/pal.asm
             dav1d/src/x86/refmvs.asm
             dav1d/src/x86/itx_avx512.asm
             dav1d/src/x86/cdef_avx2.asm
+            dav1d/src/x86/cdef_avx512.asm
             dav1d/src/x86/itx_avx2.asm
             dav1d/src/x86/cdef_sse.asm
             dav1d/src/x86/itx_sse.asm
@@ -798,7 +801,6 @@ if(HAVE_ASM)
 
         if(CONFIG_8BPC)
             list(APPEND LIBDAV1D_SOURCES_ASM
-                dav1d/src/x86/cdef_avx512.asm
                 dav1d/src/x86/filmgrain_avx512.asm
                 dav1d/src/x86/ipred_avx512.asm
                 dav1d/src/x86/loopfilter_avx512.asm
